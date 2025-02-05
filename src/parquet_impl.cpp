@@ -12,16 +12,11 @@
 #include <list>
 #include <set>
 
-#include "arrow/api.h"
-#include "arrow/io/api.h"
-#include "arrow/array.h"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
-#include "parquet/exception.h"
 #include "parquet/file_reader.h"
 #include "parquet/statistics.h"
 
-#include "heap.hpp"
 #include "exec_state.hpp"
 #include "reader.hpp"
 #include "common.hpp"
@@ -31,10 +26,9 @@ extern "C"
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/parallel.h"
-#include "access/sysattr.h"
 #include "access/nbtree.h"
 #include "access/reloptions.h"
+#include "access/sysattr.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -45,7 +39,6 @@ extern "C"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
-#include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
@@ -55,15 +48,12 @@ extern "C"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
-#include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/memdebug.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
-#include "utils/timestamp.h"
 #include "utils/typcache.h"
 
 #if PG_VERSION_NUM < 120000
@@ -71,7 +61,6 @@ extern "C"
 #include "optimizer/var.h"
 #else
 #include "access/table.h"
-#include "access/relation.h"
 #include "optimizer/optimizer.h"
 #endif
 
@@ -79,6 +68,10 @@ extern "C"
 #include "catalog/pg_am.h"
 #else
 #include "catalog/pg_am_d.h"
+#endif
+
+#if PG_VERSION_NUM >= 120000
+#include "nodes/pathnodes.h"
 #endif
 }
 
@@ -331,8 +324,7 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                str = DatumGetCString(OidOutputFunctionCall(output_fn,
-                                                            c->constvalue));
+                str = OidOutputFunctionCall(output_fn, c->constvalue);
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
@@ -393,7 +385,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   lower;
                 int     cmpres;
                 bool    satisfies;
-                std::string min = std::move(stats->EncodeMin());
+                std::string min = stats->EncodeMin();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
@@ -414,7 +406,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   upper;
                 int     cmpres;
                 bool    satisfies;
-                std::string max = std::move(stats->EncodeMax());
+                std::string max = stats->EncodeMax();
 
                 upper = bytes_to_postgres_type(max.c_str(), max.length(),
                                                arrow_type);
@@ -434,8 +426,8 @@ row_group_matches_filter(parquet::Statistics *stats,
             {
                 Datum   lower,
                         upper;
-                std::string min = std::move(stats->EncodeMin());
-                std::string max = std::move(stats->EncodeMax());
+                std::string min = stats->EncodeMin();
+                std::string max = stats->EncodeMax();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
@@ -948,9 +940,13 @@ OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
 static List *
 get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
+#if PG_VERSION_NUM >= 160000
+    List       *f = stringToQualifiedNameList(funcname, NULL);
+#else
+    List       *f = stringToQualifiedNameList(funcname);
+#endif
     Jsonb      *j = NULL;
     Oid         funcid;
-    List       *f = stringToQualifiedNameList(funcname);
     Datum       filenames;
     Oid         jsonboid = JSONBOID;
     Datum      *values;
@@ -997,6 +993,8 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     char         *funcname = NULL;
     char         *funcarg = NULL;
 
+    fdw_private->filenames = NIL;
+    fdw_private->attrs_sorted = NIL;
     fdw_private->use_mmap = false;
     fdw_private->use_threads = false;
     fdw_private->max_open_files = 0;
@@ -1209,9 +1207,10 @@ parquetGetForeignPaths(PlannerInfo *root,
     Cost        run_cost;
     bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
+    List       *source_pathkeys = NIL;
     std::list<RowGroupFilter> filters;
-    ListCell   *lc;
-    ListCell   *lc2;
+    ListCell   *lc_sorted;
+    ListCell   *lc_rootsort;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
@@ -1227,7 +1226,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 
     /*
      * Build pathkeys for the foreign table based on attrs_sorted and ORDER BY
-     * clause passed by user.
+     * (or WINDOW FUNCTION) clause passed by user.
      *
      * pathkeys is used by Postgres to sort the result. After we build pathkeys
      * for the foreign table Postgres will assume that the returned data is
@@ -1239,11 +1238,13 @@ parquetGetForeignPaths(PlannerInfo *root,
      * that an attribute on ORDER BY and "sorted" doesn't match, since in that
      * case Postgres will need to sort by remaining attributes by itself.
      */
-    forboth (lc, fdw_private->attrs_sorted, lc2, root->sort_pathkeys)
+    source_pathkeys = root->query_pathkeys;
+    lc_rootsort = list_head(source_pathkeys);
+
+    foreach (lc_sorted, fdw_private->attrs_sorted)
     {
-        PathKey    *root_pathkey = (PathKey *) lfirst(lc2);
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
-        int         attnum = lfirst_int(lc);
+        int         attnum = lfirst_int(lc_sorted);
         Oid         typid,
                     collid;
         int32       typmod;
@@ -1251,7 +1252,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         Var        *var;
         List       *attr_pathkeys;
 
-        if (root_pathkey->pk_eclass->ec_has_volatile)
+        if (lc_rootsort == NULL)
             break;
 
         /* Build an expression (simple var) for the attribute */
@@ -1265,26 +1266,55 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
+#if PG_VERSION_NUM >= 160000
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
+                                                sort_op, baserel->relids,
+                                                false);
+#else
         attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
-                                                true);
+                                                false);
+#endif
 
-        if (attr_pathkeys != NIL)
+        if (attr_pathkeys == NIL)
+            break;
+        else
         {
             PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
+            bool        is_redundant = false;
 
-            /*
-             * Compare the attribute from "sorted" option and the attribute from
-             * ORDER BY clause ("root"). If they don't match stop here and use
-             * whatever pathkeys we've build so far. Postgres will use remaining
-             * attributes from ORDER BY clause to sort data on higher level of
-             * execution.
-             */
-            if (!equal(attr_pathkey, root_pathkey))
-                break;
+            if (EC_MUST_BE_REDUNDANT(attr_pathkey->pk_eclass))
+                is_redundant = true;
+
+            if (lc_rootsort != NULL)
+            {
+                PathKey    *root_pathkey = (PathKey *) lfirst(lc_rootsort);
+
+                /*
+                 * Compare the attribute from "sorted" option and the attribute from
+                 * ORDER BY clause ("root"). If they don't match stop here and use
+                 * whatever pathkeys we've build so far. Postgres will use remaining
+                 * attributes from ORDER BY clause to sort data on higher level of
+                 * execution.
+                 */
+                if (!equal(attr_pathkey, root_pathkey))
+                {
+                    if (!is_redundant)
+                        break;
+                }
+                else
+                {
+#if PG_VERSION_NUM < 130000
+                    lc_rootsort = lnext(lc_rootsort);
+#else
+                    lc_rootsort = lnext(source_pathkeys, lc_rootsort);
+#endif
+                }
+            }
+
+            if (!is_redundant)
+                pathkeys = list_concat(pathkeys, attr_pathkeys);
         }
-
-        pathkeys = list_concat(pathkeys, attr_pathkeys);
     }
 
     foreign_path = (Path *) create_foreignscan_path(root, baserel,
@@ -1299,7 +1329,7 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (!enable_multifile && is_multi)
         foreign_path->total_cost += disable_cost;
 
-    add_path(baserel, (Path *) foreign_path);
+    add_path(baserel, foreign_path);
 
     if (fdw_private->type == RT_TRIVIAL)
         return;
@@ -1330,7 +1360,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                 RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
             cost_merge((Path *) path, list_length(private_sort->filenames),
-                       startup_cost, total_cost, private_sort->matched_rows);
+                       startup_cost, total_cost, path->rows);
 
             if (!enable_multifile_merge)
                 path->total_cost += disable_cost;
@@ -1342,7 +1372,9 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (baserel->consider_parallel > 0)
     {
         ParquetFdwPlanState *private_parallel;
-        bool use_pathkeys = false;
+        bool        use_pathkeys = false;
+        int         num_workers = max_parallel_workers_per_gather;
+        double      rows_per_worker = baserel->rows / (num_workers + 1);
 
         private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
         memcpy(private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
@@ -1354,18 +1386,14 @@ parquetGetForeignPaths(PlannerInfo *root,
         Path *path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
-                                         baserel->rows,
+                                         rows_per_worker,
                                          startup_cost,
-                                         total_cost,
+                                         startup_cost + run_cost / (num_workers + 1),
                                          use_pathkeys ? pathkeys : NULL,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
                                          (List *) private_parallel);
 
-        int num_workers = max_parallel_workers_per_gather;
-
-        path->rows = path->rows / (num_workers + 1);
-        path->total_cost       = startup_cost + run_cost / (num_workers + 1);
         path->parallel_workers = num_workers;
         path->parallel_aware   = true;
         path->parallel_safe    = true;
@@ -1386,10 +1414,10 @@ parquetGetForeignPaths(PlannerInfo *root,
             private_parallel_merge->type = private_parallel_merge->max_open_files > 0 ?
                 RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
-            Path *path = (Path *)
+            path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
-                                             baserel->rows,
+                                             rows_per_worker,
                                              startup_cost,
                                              total_cost,
                                              pathkeys,
@@ -1397,12 +1425,9 @@ parquetGetForeignPaths(PlannerInfo *root,
                                              NULL,	/* no extra plan */
                                              (List *) private_parallel_merge);
 
-            int num_workers = max_parallel_workers_per_gather;
-
             cost_merge(path, list_length(private_parallel_merge->filenames),
-                       startup_cost, total_cost, private_parallel_merge->matched_rows);
+                       startup_cost, total_cost, path->rows);
 
-            path->rows = path->rows / (num_workers + 1);
             path->total_cost = path->startup_cost + path->total_cost / (num_workers + 1);
             path->parallel_workers = num_workers;
             path->parallel_aware   = true;
@@ -1479,7 +1504,7 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
 {
-    ParquetFdwExecutionState   *festate;
+    ParquetFdwExecutionState   *festate = NULL;
     MemoryContextCallback      *callback;
     MemoryContext   reader_cxt;
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
@@ -1688,6 +1713,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
     ListCell       *lc;
     std::string     error;
 
+    MemSet(&fdw_private, 0, sizeof(fdw_private));
     get_table_options(RelationGetRelid(relation), &fdw_private);
 
     for (int i = 0; i < tupleDesc->natts; ++i)
@@ -1792,7 +1818,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
 
     delete festate;
 
-    return cnt - 1;
+    return cnt;
 }
 
 extern "C" bool
@@ -2040,7 +2066,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
 {
     List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
     Oid         catalog = PG_GETARG_OID(1);
-    ListCell   *lc;
+    ListCell   *opt_lc;
     bool        filename_provided = false;
     bool        func_provided = false;
 
@@ -2048,22 +2074,22 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
     if (catalog != ForeignTableRelationId)
         PG_RETURN_VOID();
 
-    foreach(lc, options_list)
+    foreach(opt_lc, options_list)
     {
-        DefElem    *def = (DefElem *) lfirst(lc);
+        DefElem    *def = (DefElem *) lfirst(opt_lc);
 
         if (strcmp(def->defname, "filename") == 0)
         {
             char   *filename = pstrdup(defGetString(def));
             List   *filenames;
-            ListCell *lc;
+            ListCell *file_lc;
 
             filenames = parse_filenames_list(filename);
 
-            foreach(lc, filenames)
+            foreach(file_lc, filenames)
             {
                 struct stat stat_buf;
-                char       *fn = strVal(lfirst(lc));
+                char       *fn = strVal(lfirst(file_lc));
 
                 if (stat(fn, &stat_buf) != 0)
                 {
@@ -2080,8 +2106,12 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "files_func") == 0)
         {
+#if PG_VERSION_NUM >= 160000
+            List       *funcname = stringToQualifiedNameList(defGetString(def), NULL);
+#else
+            List       *funcname = stringToQualifiedNameList(defGetString(def));
+#endif
             Oid     jsonboid = JSONBOID;
-            List   *funcname = stringToQualifiedNameList(defGetString(def));
             Oid     funcoid;
             Oid     rettype;
 
